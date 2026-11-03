@@ -1,0 +1,106 @@
+--- a/ggml-quants.c
++++ b/ggml-quants.c
+@@ -11429,6 +11429,92 @@
+         sumf += d * (sumi1 + sumi2);
+     }
+     *s = sumf;
++}
++
++void ggml_vec_dot_mxfp4_q8_0_many(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
++    assert(nrc >= 2 && nrc <= 4);
++    assert(n % QK_MXFP4 == 0 && by > 0);
++    UNUSED(bs);
++    UNUSED(bx);
++    const block_mxfp4 * restrict x = vx;
++    const block_q8_0 * y[4] = {0};
++    for (int r = 0; r < nrc; ++r) y[r] = (const block_q8_0 *) ((const char *) vy + r * by);
++    const int nb = n / QK_MXFP4;
++    float sumf[4] = {0};
++    int ib = 0;
++#if defined __ARM_NEON
++    const int8x16_t values = vld1q_s8(kvalues_mxfp4);
++    const uint8x16_t mask = vdupq_n_u8(15);
++    float32x4_t sums0[4], sums1[4];
++    for (int r = 0; r < nrc; ++r) sums0[r] = sums1[r] = vdupq_n_f32(0);
++    for (; ib + 1 < nb; ib += 2) {
++        __builtin_prefetch((const char *) &x[ib] + 512, 0, 0);
++        const uint8x16_t bits0 = vld1q_u8(x[ib].qs), bits1 = vld1q_u8(x[ib + 1].qs);
++        const int8x16_t lo0 = ggml_vqtbl1q_s8(values, vandq_u8(bits0, mask));
++        const int8x16_t hi0 = ggml_vqtbl1q_s8(values, vshrq_n_u8(bits0, 4));
++        const int8x16_t lo1 = ggml_vqtbl1q_s8(values, vandq_u8(bits1, mask));
++        const int8x16_t hi1 = ggml_vqtbl1q_s8(values, vshrq_n_u8(bits1, 4));
++        const float wx0 = GGML_E8M0_TO_FP32_HALF(x[ib].e);
++        const float wx1 = GGML_E8M0_TO_FP32_HALF(x[ib + 1].e);
++        for (int r = 0; r < nrc; ++r) {
++            const int32x4_t p0 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), lo0, vld1q_s8(y[r][ib].qs)), hi0, vld1q_s8(y[r][ib].qs + 16));
++            const int32x4_t p1 = ggml_vdotq_s32(ggml_vdotq_s32(vdupq_n_s32(0), lo1, vld1q_s8(y[r][ib + 1].qs)), hi1, vld1q_s8(y[r][ib + 1].qs + 16));
++            sums0[r] = vfmaq_n_f32(sums0[r], vcvtq_f32_s32(p0), wx0 * GGML_FP16_TO_FP32(y[r][ib].d));
++            sums1[r] = vfmaq_n_f32(sums1[r], vcvtq_f32_s32(p1), wx1 * GGML_FP16_TO_FP32(y[r][ib + 1].d));
++        }
++    }
++    for (int r = 0; r < nrc; ++r) sumf[r] = vaddvq_f32(vaddq_f32(sums0[r], sums1[r]));
++#elif defined(__AVX2__)
++    const __m128i values = _mm_loadu_si128((const __m128i *) kvalues_mxfp4);
++    const __m128i mask = _mm_set1_epi8(15);
++    __m256 sums0[4], sums1[4];
++    for (int r = 0; r < nrc; ++r) sums0[r] = sums1[r] = _mm256_setzero_ps();
++    for (; ib + 1 < nb; ib += 2) {
++        const __m128i bits0 = _mm_loadu_si128((const __m128i *) x[ib].qs);
++        const __m128i bits1 = _mm_loadu_si128((const __m128i *) x[ib + 1].qs);
++        const __m256i w0 = MM256_SET_M128I(
++            _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits0, 4), mask)),
++            _mm_shuffle_epi8(values, _mm_and_si128(bits0, mask)));
++        const __m256i w1 = MM256_SET_M128I(
++            _mm_shuffle_epi8(values, _mm_and_si128(_mm_srli_epi16(bits1, 4), mask)),
++            _mm_shuffle_epi8(values, _mm_and_si128(bits1, mask)));
++        const float wx0 = GGML_E8M0_TO_FP32_HALF(x[ib].e);
++        const float wx1 = GGML_E8M0_TO_FP32_HALF(x[ib + 1].e);
++        for (int r = 0; r < nrc; ++r) {
++            const __m256 p0 = mul_sum_i8_pairs_float(w0, _mm256_loadu_si256((const __m256i *) y[r][ib].qs));
++            const __m256 p1 = mul_sum_i8_pairs_float(w1, _mm256_loadu_si256((const __m256i *) y[r][ib + 1].qs));
++            const __m256 d0 = _mm256_set1_ps(GGML_FP16_TO_FP32(y[r][ib].d) * wx0);
++            const __m256 d1 = _mm256_set1_ps(GGML_FP16_TO_FP32(y[r][ib + 1].d) * wx1);
++#if defined(__FMA__)
++            sums0[r] = _mm256_fmadd_ps(d0, p0, sums0[r]);
++            sums1[r] = _mm256_fmadd_ps(d1, p1, sums1[r]);
++#else
++            sums0[r] = _mm256_add_ps(sums0[r], _mm256_mul_ps(d0, p0));
++            sums1[r] = _mm256_add_ps(sums1[r], _mm256_mul_ps(d1, p1));
++#endif
++        }
++    }
++    for (int r = 0; r < nrc; ++r) sumf[r] = hsum_float_8(_mm256_add_ps(sums0[r], sums1[r]));
++#endif
++    // Preserve the single-row scalar accumulation, including odd block tails.
++    for (; ib < nb; ++ib) {
++        int8_t lo[16], hi[16];
++        for (int j = 0; j < 16; ++j) {
++            lo[j] = kvalues_mxfp4[x[ib].qs[j] & 15];
++            hi[j] = kvalues_mxfp4[x[ib].qs[j] >> 4];
++        }
++        const float wx = GGML_E8M0_TO_FP32_HALF(x[ib].e);
++        for (int r = 0; r < nrc; ++r) {
++            int a = 0, b = 0;
++            for (int j = 0; j < 16; ++j) {
++                a += y[r][ib].qs[j] * lo[j];
++                b += y[r][ib].qs[j + 16] * hi[j];
++            }
++            const float d = GGML_FP16_TO_FP32(y[r][ib].d) * wx;
++            sumf[r] += d * (a + b);
++        }
++    }
++    for (int r = 0; r < nrc; ++r) s[r] = sumf[r];
+ }
+ 
+ void ggml_vec_dot_iq4_xs_q8_K(int n, float * restrict s, size_t bs, const void * restrict vx, size_t bx, const void * restrict vy, size_t by, int nrc) {
+--- a/ggml-quants.h
++++ b/ggml-quants.h
+@@ -99,6 +99,8 @@
+ void ggml_vec_dot_iq1_m_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_iq4_nl_q8_0 (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_mxfp4_q8_0  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
++// One MXFP4 row against 2..4 Q8_0 rows, separated by by bytes; contiguous results.
++void ggml_vec_dot_mxfp4_q8_0_many(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_iq4_xs_q8_K (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ void ggml_vec_dot_iq3_s_q8_K  (int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc);
+ 

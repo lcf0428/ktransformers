@@ -17,6 +17,7 @@ compile_commands.json
 ktransformers/server/local_store/
 ktransformers/server_test1.db
 *.patch
+!patches/llama-cpp-mxfp4-token-reuse.patch
 img/
 tmp*.txt
 test.txt

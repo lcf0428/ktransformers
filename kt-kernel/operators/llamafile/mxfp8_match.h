@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
+#include <cstddef>
 #if defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -58,6 +59,43 @@ inline float dot_gguf_mxfp4_mxfp8(const uint8_t* weights, const float* input, in
   }
  }
  return sum;
+#endif
+}
+
+// Reuse a GGUF weight block across independent activation rows. Keep each
+// row's conversion, accumulation and reduction identical to the single-row dot.
+template <int Rows>
+inline void dot_gguf_mxfp4_mxfp8_many(const uint8_t* weights, const float* input,
+                                    ptrdiff_t input_stride, int blocks,
+                                    float* output, ptrdiff_t output_stride) {
+ static_assert(Rows >= 2 && Rows <= 4, "MXFP4 token tile must contain 2..4 rows");
+#if defined(__AVX512BF16__) && defined(__AVX512F__)
+ static const int8_t values[16]={0,1,2,3,4,6,8,12,0,-1,-2,-3,-4,-6,-8,-12};
+ const __m128i table=_mm_loadu_si128(reinterpret_cast<const __m128i*>(values));
+ const __m128i mask=_mm_set1_epi8(15);
+ __m512 sums[Rows];
+ for (int r=0;r<Rows;++r) sums[r]=_mm512_setzero_ps();
+ for (int b=0;b<blocks;++b) {
+  const uint8_t* w=weights+b*17;
+  const __m128i packed=_mm_loadu_si128(reinterpret_cast<const __m128i*>(w+1));
+  const __m128i lo=_mm_shuffle_epi8(table,_mm_and_si128(packed,mask));
+  const __m128i hi=_mm_shuffle_epi8(table,_mm_and_si128(_mm_srli_epi16(packed,4),mask));
+  const __m512 scale=_mm512_set1_ps(std::ldexp(1.0f,int(w[0])-128));
+  const __m512 wl=_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(lo)),scale);
+  const __m512 wh=_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(hi)),scale);
+  const __m512bh wb=_mm512_cvtne2ps_pbh(wh,wl);
+  for (int r=0;r<Rows;++r) {
+   const float* x=input+r*input_stride+b*32;
+   const __m512bh xb=_mm512_cvtne2ps_pbh(_mm512_loadu_ps(x+16),_mm512_loadu_ps(x));
+   sums[r]=_mm512_dpbf16_ps(sums[r],wb,xb);
+  }
+ }
+ for (int r=0;r<Rows;++r) output[r*output_stride]=_mm512_reduce_add_ps(sums[r]);
+#else
+ // With -ffast-math a scalar multi-row loop may be reassociated differently
+ // from the old dot. Retain the original kernel on CPUs without BF16 SIMD.
+ for (int r=0;r<Rows;++r)
+  output[r*output_stride]=dot_gguf_mxfp4_mxfp8(weights, input+r*input_stride, blocks);
 #endif
 }
 }

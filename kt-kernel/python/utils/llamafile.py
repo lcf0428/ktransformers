@@ -8,6 +8,7 @@ import torch
 # Use relative imports for package structure
 from ..experts_base import BaseMoEWrapper
 from .loader import GGUFLoader
+from .mxfp4_reuse import group_min_len, token_reuse_enabled
 from kt_kernel_ext.moe import MOEConfig
 
 try:
@@ -83,6 +84,7 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
                 "Please recompile with Llamafile enabled."
             )
 
+        token_reuse_enabled()  # Reject invalid options before loading expert weights.
         self.native_weights = native_weights
         if native_weights is not None:
             if threadpool_count != 1:
@@ -235,7 +237,9 @@ class LlamafileMoEWrapper(BaseMoEWrapper):
 
         # Llamafile-specific configuration
         moe_config.m_block = 32  # Parallel block size
-        moe_config.group_min_len = 10  # Use forward_one when qlen < 10
+        moe_config.group_min_len = group_min_len(
+            (gate_type, up_type, down_type), native=self.native_weights is not None
+        )
         # Defensive fallback: chunked_prefill_size <= 0 (e.g. -1 meaning "disabled" in sglang
         # baseline) would otherwise let C++ compute max_possible_qlen() = max(max_len=-1,
         # group_max_len=max(1,-1)=1) = 1, sizing per-NUMA fp32 output buffer
